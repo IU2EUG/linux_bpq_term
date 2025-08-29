@@ -1,1 +1,1 @@
-# linux_bpq_term
+# A Linux BPQ term in C
