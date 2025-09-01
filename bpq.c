@@ -11,11 +11,13 @@
 //  • Local echo: comandi inviati appaiono anche nell’output (disattivabile con --no-local-echo)
 //  • RX accumulator: nessuna riga viene spezzata su confini di pacchetto (righe solo su '\n')
 //  • Ctrl-Z: inviato al nodo come 0x1A (SUB); opzionale sospensione UNIX con --no-pass-ctrl-z
+//  • Keepalive applicativo (TELNET NOP) via --keepalive SECONDS + SO_KEEPALIVE TCP
+//  • History comandi su Freccia Su/Giù (+ backup/ripristino riga corrente)
 //
 // Build: gcc -O2 -Wall -o bpqchat bpqchat.c -lncursesw
 // Uso  : ./bpqchat <host> <port>
 //        [-u USER -p PASS] [--blind-auto] [--cr-only] [--upper] [--no-auto-help] [--no-local-echo]
-//        [--no-pass-ctrl-z] [--ctrl-z-cr]
+//        [--no-pass-ctrl-z] [--ctrl-z-cr] [--keepalive SECONDS]
 // Opz. : --unlock-delay MS (default 1200), --unlock-quiet MS (default 300)
 
 #define _POSIX_C_SOURCE 200809L
@@ -36,8 +38,12 @@
 #include <wchar.h>
 #include <wctype.h>
 
+#ifdef __linux__
+#include <netinet/tcp.h>
+#endif
+
 /* Telnet */
-enum { IAC=255, DONT=254, DO_=253, WONT=252, WILL=251, SB=250, SE=240 };
+enum { IAC=255, DONT=254, DO_=253, WONT=252, WILL=251, SB=250, SE=240, NOP_=241 };
 
 /* UI */
 static int sockfd=-1;
@@ -51,6 +57,10 @@ static int opt_local_echo=1;            /* echo locale attivo di default */
 static int opt_pass_ctrl_z=1;           /* default: passa ^Z (0x1A) al nodo */
 static int opt_ctrlz_append_cr=0;       /* dopo ^Z, invia anche EOL se settato */
 static long unlock_delay_ms=1200, unlock_quiet_ms=300;
+
+/* Keepalive */
+static long keepalive_secs = 0;         /* 0 = disabilitato */
+static struct timespec last_tx_ts;      /* ultimo invio verso socket */
 
 /* Colori */
 #define CP_OUT 1  /* verde */
@@ -110,6 +120,12 @@ static void on_winch(int sig){ (void)sig; need_resize=1; }
 typedef struct { int state; unsigned char cmd; } telnet_parser_t;
 static void telnet_send3(unsigned char a,unsigned char b,unsigned char c){
     unsigned char t[3]={a,b,c}; if (write_all(sockfd,t,3)<0) die_cleanup("write telnet: %s", strerror(errno));
+    clock_gettime(CLOCK_MONOTONIC, &last_tx_ts);
+}
+static void telnet_send_nop(void){
+    unsigned char t[2]={IAC, NOP_};
+    if (write_all(sockfd, t, 2)<0) die_cleanup("write telnet NOP: %s", strerror(errno));
+    clock_gettime(CLOCK_MONOTONIC, &last_tx_ts);
 }
 static size_t telnet_filter_and_reply(telnet_parser_t *tp,
                                       const unsigned char *in, size_t len,
@@ -162,6 +178,18 @@ static size_t normalize_incoming(const unsigned char *in,size_t len,unsigned cha
 }
 
 /* ---------- TCP ---------- */
+static void set_tcp_keepalive(int fd, long idle_s, long intvl_s, int cnt){
+    int on=1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+    if (idle_s>0) { int v=(int)idle_s; setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, sizeof(v)); }
+#endif
+#ifdef TCP_KEEPINTVL
+    if (intvl_s>0){ int v=(int)intvl_s; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v)); }
+#endif
+#ifdef TCP_KEEPCNT
+    if (cnt>0){ int v=cnt; setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof(v)); }
+#endif
+}
 static int connect_tcp(const char*host,const char*port){
     struct addrinfo hints,*res,*rp; int fd=-1;
     memset(&hints,0,sizeof hints); hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
@@ -199,7 +227,7 @@ static void ui_make_windows(void){
     curs_set(1);
 
     werase(win_status);
-    mvwprintw(win_status, 0, 0, "Output SOPRA (verde) — Comandi QUI (bianco). PgUp/PgDn/↑/↓/Home/End. F10 o Ctrl-C: esci. Ctrl-Z: SUB");
+    mvwprintw(win_status, 0, 0, "Output SOPRA (verde) — Comandi QUI (bianco). PgUp/PgDn/Home/End scroll. F10 o Ctrl-C: esci. Ctrl-Z: SUB");
     wrefresh(win_status);
 }
 static void ui_init(void){
@@ -393,6 +421,7 @@ static void render_input(const wchar_t *buf){
 static void send_eol(void){
     if (opt_cr_only){ char cr='\r'; if (write_all(sockfd,&cr,1)<0) die_cleanup("write: %s", strerror(errno)); }
     else { char crlf[2]={'\r','\n'}; if (write_all(sockfd,crlf,2)<0) die_cleanup("write: %s", strerror(errno)); }
+    clock_gettime(CLOCK_MONOTONIC, &last_tx_ts);
 }
 
 /* Duplica ogni IAC (0xFF) in TX, con write_all */
@@ -404,6 +433,7 @@ static void write_telnet_safe(const unsigned char *s, size_t n){
             if (write_all(sockfd, &c, 1)<0) die_cleanup("write: %s", strerror(errno));
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &last_tx_ts);
 }
 
 static void send_line_utf8_telnet_safe(const char*s){ write_telnet_safe((const unsigned char*)s, strlen(s)); send_eol(); }
@@ -462,13 +492,62 @@ static void local_echo_line(const wchar_t *src){
     }
 }
 
+/* ---------- History comandi ---------- */
+#define HIST_MAX 200
+static wchar_t *hist[HIST_MAX];
+static int hist_count = 0;
+static int hist_pos = -1; /* -1 = non in navigazione; 0..hist_count-1 = indice in history (0 = più vecchio) */
+/* backup della riga in editing quando si entra in history con ↑ */
+static wchar_t edit_backup[4096];
+static int edit_saved = 0;
+
+static void history_free_all(void){
+    for (int i=0;i<hist_count;i++){ free(hist[i]); }
+    hist_count=0; hist_pos=-1;
+}
+static void history_push(const wchar_t *wline){
+    if (!wline || !*wline) return;
+    if (hist_count>0 && wcscmp(hist[hist_count-1], wline)==0) return; /* evita duplicati consecutivi */
+    wchar_t *cpy = wcsdup(wline);
+    if (!cpy) return;
+    if (hist_count < HIST_MAX){
+        hist[hist_count++] = cpy;
+    } else {
+        free(hist[0]);
+        memmove(hist, hist+1, sizeof(hist[0])*(HIST_MAX-1));
+        hist[HIST_MAX-1] = cpy;
+    }
+}
+static int history_prev(wchar_t *dst, size_t dstcap){
+    if (hist_count==0) return 0;
+    if (hist_pos==-1) hist_pos = hist_count-1;
+    else if (hist_pos>0) hist_pos--;
+    wcsncpy(dst, hist[hist_pos], dstcap-1);
+    dst[dstcap-1]=L'\0';
+    return 1;
+}
+static int history_next(wchar_t *dst, size_t dstcap){
+    if (hist_count==0 || hist_pos==-1) return 0;
+    if (hist_pos < hist_count-1){
+        hist_pos++;
+        wcsncpy(dst, hist[hist_pos], dstcap-1);
+        dst[dstcap-1]=L'\0';
+        return 1;
+    } else {
+        /* dopo l'ultima: svuota buffer e reset pos */
+        hist_pos=-1;
+        dst[0]=L'\0';
+        return 1;
+    }
+}
+
 /* ---------- main ---------- */
 int main(int argc, char **argv){
     signal(SIGPIPE, SIG_IGN);   /* non morire su write dopo chiusura peer */
     signal(SIGTSTP, SIG_IGN);   /* gestiamo ^Z manualmente (pass-thru) */
 
     if (argc<3){
-        fprintf(stderr,"Uso: %s <host> <port> [-u USER -p PASS] [--blind-auto] [--cr-only] [--upper] [--no-auto-help] [--no-local-echo] [--no-pass-ctrl-z] [--ctrl-z-cr] [--unlock-delay MS] [--unlock-quiet MS]\n", argv[0]);
+        fprintf(stderr,"Uso: %s <host> <port> [-u USER -p PASS] [--blind-auto] [--cr-only] [--upper] [--no-auto-help] [--no-local-echo] [--no-pass-ctrl-z] [--ctrl-z-cr] [--keepalive SECONDS] [--unlock-delay MS] [--unlock-quiet MS]\n", argv[0]);
         return 1;
     }
     const char *host=argv[1], *port=argv[2];
@@ -488,6 +567,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--ctrl-z-cr")){ opt_ctrlz_append_cr=1; }
         else if (!strcmp(argv[i],"--unlock-delay") && i+1<argc){ unlock_delay_ms=strtol(argv[++i],NULL,10); if (unlock_delay_ms<0) unlock_delay_ms=0; }
         else if (!strcmp(argv[i],"--unlock-quiet") && i+1<argc){ unlock_quiet_ms=strtol(argv[++i],NULL,10); if (unlock_quiet_ms<0) unlock_quiet_ms=0; }
+        else if (!strcmp(argv[i],"--keepalive") && i+1<argc){ keepalive_secs = strtol(argv[++i],NULL,10); if (keepalive_secs<0) keepalive_secs=0; }
         else { fprintf(stderr,"Opzione sconosciuta: %s\n", argv[i]); return 1; }
     }
     if ((alp.enabled||alb.enabled) && (alp.user[0]=='\0' || alp.pass[0]=='\0')){
@@ -499,6 +579,12 @@ int main(int argc, char **argv){
     ui_init();
 
     sockfd = connect_tcp(host, port);
+
+    /* Abilita SO_KEEPALIVE quando è richiesto keepalive applicativo */
+    if (keepalive_secs > 0){
+        set_tcp_keepalive(sockfd, keepalive_secs, keepalive_secs, 3);
+    }
+
     telnet_parser_t tp={0};
 
     /* Stato login/lock e recent */
@@ -511,6 +597,9 @@ int main(int argc, char **argv){
 
     /* Input buffer (wide) */
     wchar_t ibuf[4096]; size_t ilen=0; ibuf[0]=L'\0';
+
+    /* Track TX (inizializza) */
+    clock_gettime(CLOCK_MONOTONIC, &last_tx_ts);
 
     /* Primo render */
     render_out(); render_input(ibuf);
@@ -627,6 +716,14 @@ int main(int argc, char **argv){
             auto_help_sent=1;
         }
 
+        /* Keepalive applicativo — invia TELNET NOP ogni keepalive_secs */
+        if (keepalive_secs > 0){
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+            if (since_ms(last_tx_ts, now) >= keepalive_secs * 1000L){
+                telnet_send_nop();
+            }
+        }
+
         /* Tastiera (wide) */
         wint_t wch;
         int ch = get_wch(&wch);
@@ -661,12 +758,37 @@ int main(int argc, char **argv){
                 }
             }
 
+            /* Scroll output su PgUp/PgDn/Home/End (invariato) */
             else if (wch == KEY_PPAGE){ int vis=rows-2; if (vis<1) vis=1; view_top -= vis/2; if (view_top<0) view_top=0; render_out(); render_input(ibuf); }
             else if (wch == KEY_NPAGE){ int vis=rows-2; if (vis<1) vis=1; view_top += vis/2; int max_top=vis_count-vis; if (max_top<0) max_top=0; if (view_top>max_top) view_top=max_top; render_out(); render_input(ibuf); }
             else if (wch == KEY_HOME){ view_top=0; render_out(); render_input(ibuf); }
             else if (wch == KEY_END){ int vis=rows-2; if (vis<1) vis=1; view_top = vis_count - vis; if (view_top<0) view_top=0; render_out(); render_input(ibuf); }
-            else if (wch == KEY_UP){ if (view_top>0) view_top--; render_out(); render_input(ibuf); }
-            else if (wch == KEY_DOWN){ int vis=rows-2; if (vis<1) vis=1; int max_top=vis_count-vis; if (max_top<0) max_top=0; if (view_top<max_top) view_top++; render_out(); render_input(ibuf); }
+
+            /* History su Freccia Su/Giù */
+            else if (wch == KEY_UP){
+                if (!edit_saved){ /* salva la riga in editing la prima volta */
+                    wcsncpy(edit_backup, ibuf, (sizeof(edit_backup)/sizeof(edit_backup[0]))-1);
+                    edit_backup[(sizeof(edit_backup)/sizeof(edit_backup[0]))-1]=L'\0';
+                    edit_saved = 1;
+                }
+                if (history_prev(ibuf, sizeof(ibuf)/sizeof(ibuf[0]))){
+                    ilen = wcslen(ibuf);
+                    render_input(ibuf);
+                }
+            }
+            else if (wch == KEY_DOWN){
+                if (history_next(ibuf, sizeof(ibuf)/sizeof(ibuf[0]))){
+                    if (hist_pos == -1 && edit_saved){
+                        /* uscito dalla history: ripristina l'editing salvato */
+                        wcsncpy(ibuf, edit_backup, (sizeof(ibuf)/sizeof(ibuf[0]))-1);
+                        ibuf[(sizeof(ibuf)/sizeof(ibuf[0]))-1]=L'\0';
+                        edit_saved = 0;
+                    }
+                    ilen = wcslen(ibuf);
+                    render_input(ibuf);
+                }
+            }
+
             else if (wch == '\n' || wch == '\r'){
                 /* invio comando */
                 ibuf[ilen]=L'\0';
@@ -678,11 +800,11 @@ int main(int argc, char **argv){
                         tmp = wcsdup(ibuf);
                         if (tmp){ for (size_t i=0; tmp[i]; ++i) tmp[i] = towupper(tmp[i]); src = tmp; }
                     }
-                    /* ECHO LOCALE (wide) prima/insieme all'invio */
+                    /* echo locale */
                     if (opt_local_echo){
                         local_echo_line(src);
                     }
-                    /* wide -> utf8 e TX telnet-safe */
+                    /* wide -> utf8 e TX */
                     mbstate_t st; memset(&st,0,sizeof st);
                     size_t need = 4*wcslen(src) + 1;
                     char *out8 = (char*)malloc(need);
@@ -700,17 +822,25 @@ int main(int argc, char **argv){
                         send_eol();
                         free(out8);
                     }
+                    /* salva in history */
+                    history_push(src);
+                    hist_pos = -1;   /* reset navigazione history */
+                    edit_saved = 0;  /* backup consumato */
                     free(tmp);
                 }
                 ilen=0; ibuf[ilen]=L'\0'; render_input(ibuf);
             } else if (wch == KEY_BACKSPACE || wch == 127 || wch == 8){
                 if (ilen>0) { ilen--; ibuf[ilen]=L'\0'; }
+                hist_pos = -1; edit_saved = 0;
                 render_input(ibuf);
             } else if (wch == KEY_DC){
                 if (ilen>0) { ilen--; ibuf[ilen]=L'\0'; }
+                hist_pos = -1; edit_saved = 0;
                 render_input(ibuf);
             } else if (iswprint(wch)){
                 if (ilen < (sizeof(ibuf)/sizeof(ibuf[0]))-1) ibuf[ilen++]=(wchar_t)wch, ibuf[ilen]=L'\0';
+                hist_pos = -1; /* digitando, esci da navigazione history */
+                edit_saved = 0; /* e invalida l'eventuale backup */
                 render_input(ibuf);
             }
         }
